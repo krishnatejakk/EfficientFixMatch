@@ -71,12 +71,12 @@ class GLISTERStrategy(DataSelectionStrategy):
         Number of greedy selection rounds when selection method is RGreedy (default: 15)
     """
 
-    def __init__(self, trainloader, valloader, model, tea_model, ssl_alg, loss,
-                 eta, device, num_classes, linear_layer, selection_type, r=15, valid=True):
+    def __init__(self, trainloader, valloader, model, loss,
+                 eta, device, num_classes, linear_layer, selection_type, args, r=15, valid=True):
         """
         Constructor method
         """
-        super().__init__(trainloader, valloader, model, tea_model, ssl_alg, num_classes, linear_layer, loss, device)
+        super().__init__(trainloader, valloader, model, num_classes, linear_layer, loss, device, args)
         self.eta = eta  # step size for the one step gradient update
         self.init_out = list()
         self.init_l1 = list()
@@ -167,7 +167,7 @@ class GLISTERStrategy(DataSelectionStrategy):
                 self.grads_val_curr = torch.mean(l0_grads, dim=0).view(-1, 1)
         else:
             if first_init:
-                for batch_idx, (ul_weak_aug, ul_strong_aug, _) in enumerate(self.trainloader):
+                for batch_idx, ((ul_weak_aug, ul_strong_aug), _) in enumerate(self.trainloader):
                     ul_weak_aug, ul_strong_aug = ul_weak_aug.to(self.device), ul_strong_aug.to(self.device)
                     if batch_idx == 0:
                         out, l1 = self.model(ul_strong_aug, last=True, freeze=True)
@@ -257,7 +257,7 @@ class GLISTERStrategy(DataSelectionStrategy):
         # if isinstance(element, list):
         grads_X += self.grads_per_elem[element].sum(dim=0)
 
-    def select(self, budget, model_params, tea_model_params):
+    def select(self, budget, model_params):
         """
         Apply naive greedy method for data selection
 
@@ -278,7 +278,7 @@ class GLISTERStrategy(DataSelectionStrategy):
             Tensor containing gradients of datapoints present in greedySet
         """
         t_ng_start = time.time()  # naive greedy start time
-        self.update_model(model_params, tea_model_params)
+        self.update_model(model_params)
         if self.valid:
             self.compute_gradients(store_t=False)
         else:

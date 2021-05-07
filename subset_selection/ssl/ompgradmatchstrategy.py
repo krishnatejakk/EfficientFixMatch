@@ -79,7 +79,7 @@ class OMPGradMatchStrategy(DataSelectionStrategy):
             ind = torch.nonzero(reg).view(-1)
         return ind.tolist(), reg[ind].tolist()
 
-    def select(self, budget, model_params, tea_model_params):
+    def select(self, budget, model_params):
         """
         Apply OMP Algorithm for data selection
 
@@ -100,7 +100,7 @@ class OMPGradMatchStrategy(DataSelectionStrategy):
             Tensor containing weights of each instance
         """
         omp_start_time = time.time()
-        self.update_model(model_params, tea_model_params)
+        self.update_model(model_params)
         if self.selection_type == 'PerClass':
             self.get_labels(valid=self.valid)
             idxs = []

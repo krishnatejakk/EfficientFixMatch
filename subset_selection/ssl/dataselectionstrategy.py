@@ -44,7 +44,7 @@ class DataSelectionStrategy(object):
         self.device = device
         self.args = args
 
-    def select(self, budget, model_params, tea_model_params):
+    def select(self, budget, model_params):
         pass
 
     def ssl_loss(self, ul_weak_data, ul_strong_data, labels=False):

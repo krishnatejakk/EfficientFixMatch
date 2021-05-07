@@ -55,12 +55,12 @@ class CRAIGStrategy(DataSelectionStrategy):
          - 'Supervised':  Supervised Implementation where the facility location problem is solved using a sparse similarity matrix by assigning the similarity of a point with other points of different class to zero.
     """
 
-    def __init__(self, trainloader, valloader, model, tea_model, ssl_alg, loss,
-                 device, num_classes, linear_layer, if_convex, selection_type, optimizer='lazy'):
+    def __init__(self, trainloader, valloader, model, loss,
+                 device, num_classes, linear_layer, if_convex, selection_type, args, optimizer='lazy'):
         """
         Constructer method
         """
-        super().__init__(trainloader, valloader, model, tea_model, ssl_alg, num_classes, linear_layer, loss, device)
+        super().__init__(trainloader, valloader, model, num_classes, linear_layer, loss, device, args)
         self.if_convex = if_convex
         self.selection_type = selection_type
         self.optimizer = optimizer
@@ -94,7 +94,7 @@ class CRAIGStrategy(DataSelectionStrategy):
         # dist = torch.exp(-1 * torch.pow(x - y, 2).sum(2))
         return dist
 
-    def compute_score(self, model_params, tea_model_params, idxs):
+    def compute_score(self, model_params, idxs):
         """
         Compute the score of the indices.
 
@@ -113,14 +113,12 @@ class CRAIGStrategy(DataSelectionStrategy):
                                                     sampler=SubsetRandomSampler(idxs),
                                                     pin_memory=True)
         self.model.load_state_dict(model_params)
-        if self.tea_model is not None:
-            self.tea_model.load_state_dict(tea_model_params)
 
         self.N = 0
         g_is = []
 
         if self.if_convex:
-            for batch_idx, (ul_weak_aug, ul_strong_aug, _) in enumerate(subset_loader):
+            for batch_idx, ((ul_weak_aug, ul_strong_aug), _) in enumerate(subset_loader):
                 if self.selection_type == 'PerBatch':
                     self.N += 1
                     g_is.append(ul_strong_aug.view(ul_strong_aug.size()[0], -1).mean(dim=0).view(1, -1))
@@ -129,7 +127,7 @@ class CRAIGStrategy(DataSelectionStrategy):
                     g_is.append(ul_strong_aug.view(ul_strong_aug.size()[0], -1))
         else:
             embDim = self.model.get_embedding_dim()
-            for batch_idx, (ul_weak_aug, ul_strong_aug, _) in enumerate(subset_loader):
+            for batch_idx, ((ul_weak_aug, ul_strong_aug), _) in enumerate(subset_loader):
                 ul_weak_aug, ul_strong_aug = ul_weak_aug.to(self.device), ul_strong_aug.to(self.device)
                 if self.selection_type == 'PerBatch':
                     self.N += 1
@@ -219,7 +217,7 @@ class CRAIGStrategy(DataSelectionStrategy):
                 kernel[i, x] = 1
         return kernel
 
-    def select(self, budget, model_params, tea_model_params):
+    def select(self, budget, model_params):
         """
         Data selection method using different submodular optimization
         functions.
@@ -249,7 +247,7 @@ class CRAIGStrategy(DataSelectionStrategy):
             self.get_labels(valid=False)
             for i in range(self.num_classes):
                 idxs = torch.where(self.trn_lbls == i)[0]
-                self.compute_score(model_params, tea_model_params, idxs)
+                self.compute_score(model_params, idxs)
                 fl = apricot.functions.facilityLocation.FacilityLocationSelection(random_state=0, metric='precomputed',
                                                                                   n_samples=math.ceil(
                                                                                       budget * len(idxs) / self.N_trn),
@@ -268,14 +266,14 @@ class CRAIGStrategy(DataSelectionStrategy):
                 if i == 0:
                     idxs = torch.where(self.trn_lbls == i)[0]
                     N = len(idxs)
-                    self.compute_score(model_params, tea_model_params, idxs)
+                    self.compute_score(model_params, idxs)
                     row = idxs.repeat_interleave(N)
                     col = idxs.repeat(N)
                     data = self.dist_mat.flatten()
                 else:
                     idxs = torch.where(self.trn_lbls == i)[0]
                     N = len(idxs)
-                    self.compute_score(model_params, tea_model_params, idxs)
+                    self.compute_score(model_params, idxs)
                     row = torch.cat((row, idxs.repeat_interleave(N)), dim=0)
                     col = torch.cat((col, idxs.repeat(N)), dim=0)
                     data = np.concatenate([data, self.dist_mat.flatten()], axis=0)
@@ -288,7 +286,7 @@ class CRAIGStrategy(DataSelectionStrategy):
             gammas = self.compute_gamma(total_greedy_list)
         elif self.selection_type == 'PerBatch':
             idxs = torch.arange(self.N_trn)
-            self.compute_score(model_params, tea_model_params, idxs)
+            self.compute_score(model_params, idxs)
             fl = apricot.functions.facilityLocation.FacilityLocationSelection(random_state=0, metric='precomputed',
                                                                               n_samples=math.ceil(
                                                                                   budget / self.trainloader.batch_size),
