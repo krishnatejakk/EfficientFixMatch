@@ -1,4 +1,3 @@
-import numpy as np
 import torch
 from torch.nn.functional import cross_entropy
 
@@ -64,11 +63,12 @@ class DataSelectionStrategy(object):
             else:
                 return targets_u.argmax(dim=1)
         else:
-            L_consistency = self.loss(stu_unlabeled_strong_logits, targets_u) * mask
+            #L_consistency = self.loss(stu_unlabeled_strong_logits, targets_u) * mask
+            L_consistency = self.loss(stu_unlabeled_strong_logits, targets_u)
             return L_consistency, stu_unlabeled_strong_logits, l1_strong, targets_u, mask
 
     def get_labels(self, valid=False):
-        for batch_idx, (ul_weak_aug, ul_strong_aug, _) in enumerate(self.trainloader):
+        for batch_idx, ((ul_weak_aug, ul_strong_aug), _) in enumerate(self.trainloader):
             ul_weak_aug, ul_strong_aug = ul_weak_aug.to(self.device), ul_strong_aug.to(self.device)
             targets = self.ssl_loss(ul_weak_data=ul_weak_aug, ul_strong_data=ul_strong_aug, labels=True)
             if batch_idx == 0:

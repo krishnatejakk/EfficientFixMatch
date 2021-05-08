@@ -1,4 +1,5 @@
 import argparse
+import copy
 import logging
 import math
 import os
@@ -13,16 +14,41 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.optim.lr_scheduler import LambdaLR
-from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
+from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, Subset, Dataset
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
-
 from dataset.cifar import DATASET_GETTERS
 from utils import AverageMeter, accuracy
-
+from typing import TypeVar, Generic, Iterable, Iterator, Sequence, List, Optional, Tuple
 logger = logging.getLogger(__name__)
 best_acc = 0
+
+
+T_co = TypeVar('T_co', covariant=True)
+
+class CustomSubset(Dataset[T_co]):
+    r"""
+    Subset of a dataset at specified indices.
+
+    Arguments:
+        dataset (Dataset): The whole Dataset
+        indices (sequence): Indices in the whole set selected for subset
+        gammas (sequence): Weight of each data point in the subset
+    """
+    dataset: Dataset[T_co]
+    indices: Sequence[int]
+
+    def __init__(self, dataset: Dataset[T_co], indices: Sequence[int], gammas: Sequence[float]) -> None:
+        self.dataset = dataset
+        self.indices = indices
+        self.gammas = gammas
+
+    def __getitem__(self, idx):
+        return self.dataset[self.indices[idx]], self.gammas[idx]
+
+    def __len__(self):
+        return len(self.indices)
 
 
 def save_checkpoint(state, is_best, checkpoint, filename='checkpoint.pth.tar'):
@@ -131,6 +157,8 @@ def main():
                         help="Subset Size")
     parser.add_argument('--R', type=int, default=20,
                         help="Subset selection every R epoch")
+    parser.add_argument('--kappa', type=float, default=0.5,
+                        help="Warm Start Coefficient")
     args = parser.parse_args()
     global best_acc
 
@@ -213,28 +241,6 @@ def main():
 
     if args.local_rank == 0:
         torch.distributed.barrier()
-
-    train_sampler = RandomSampler if args.local_rank == -1 else DistributedSampler
-
-    labeled_trainloader = DataLoader(
-        labeled_dataset,
-        sampler=train_sampler(labeled_dataset),
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        drop_last=True)
-
-    unlabeled_trainloader = DataLoader(
-        unlabeled_dataset,
-        sampler=train_sampler(unlabeled_dataset),
-        batch_size=args.batch_size * args.mu,
-        num_workers=args.num_workers,
-        drop_last=True)
-
-    test_loader = DataLoader(
-        test_dataset,
-        sampler=SequentialSampler(test_dataset),
-        batch_size=args.batch_size,
-        num_workers=args.num_workers)
 
     if args.local_rank not in [-1, 0]:
         torch.distributed.barrier()
@@ -321,10 +327,21 @@ def train_subset(args, labeled_dataset, unlabeled_dataset, test_dataset,
     else:
         max_epochs = int(args.epochs * args.fraction)
 
-    sel_iter = int((args.R * len(unlabeled_dataset) * args.fraction) // (args.batch_size * args.mu))  # build optimizer
+    sel_iter = int((args.R * len(unlabeled_dataset) * args.fraction) // (args.batch_size * args.mu))
     N = len(unlabeled_dataset)
     bud = int(args.fraction * N)
     start_idxs = np.random.choice(N, size=bud, replace=False)
+    gammas = torch.ones(len(start_idxs))
+    unlabeled_subset = CustomSubset(unlabeled_dataset, start_idxs, gammas=gammas)
+
+    train_sampler = RandomSampler if args.local_rank == -1 else DistributedSampler
+
+    unlabeled_subloader = DataLoader(
+                            unlabeled_subset,
+                            sampler=train_sampler(unlabeled_subset),
+                            batch_size=args.batch_size * args.mu,
+                            num_workers=args.num_workers,
+                            drop_last=True)
 
     labeled_seq_loader = DataLoader(
         labeled_dataset,
@@ -348,109 +365,99 @@ def train_subset(args, labeled_dataset, unlabeled_dataset, test_dataset,
 
     criterion_nored = nn.CrossEntropyLoss(reduction='none')
 
-    setf_model = DataSelectionStrategy(unlabeled_seq_loader, labeled_seq_loader, model1, args.num_classes, True, criterion_nored, args.device, args)
-    setf_model.compute_gradients()
-    print()
-    # if args.dss_strategy == 'GradMatch':
-    #     # OMPGradMatch Selection strategy
-    #     setf_model = OMPGradMatchStrategy(unlabeled_seq_loader, labeled_seq_loader, model1, teacher_model, ssl_alg,
-    #                                       consistency_nored,
-    #                                       cfg.lr, device, num_classes, True, 'PerClassPerGradient', valid=False,
-    #                                       lam=0.25, eps=1e-10)
-    #     kappa_iterations = int(cfg.kappa * max_iteration)
-    #
-    # elif args.dss_strategy == 'GradMatchPB':
-    #     setf_model = OMPGradMatchStrategy(ult_seq_loader, lt_seq_loader, model1, teacher_model, ssl_alg,
-    #                                       consistency_nored,
-    #                                       cfg.lr, device, num_classes, True, 'PerBatch', valid=False, lam=0.25,
-    #                                       eps=1e-10)
-    #     kappa_iterations = int(cfg.kappa * max_iteration)
-    #
-    # elif args.dss_strategy == 'GLISTER':
-    #     # GLISTER Selection strategy
-    #     setf_model = GLISTERStrategy(ult_seq_loader, lt_seq_loader, model1, teacher_model1, ssl_alg, consistency_nored,
-    #                                  cfg.lr, device, num_classes, False, 'Stochastic', r=int(bud), valid=True)
-    #     kappa_iterations = int(cfg.kappa * max_iteration)
-    #
-    # elif args.dss_strategy == 'GLISTER_UL':
-    #     # GLISTER Selection strategy
-    #     setf_model = GLISTERStrategy(ult_seq_loader, lt_seq_loader, model1, teacher_model1, ssl_alg, consistency_nored,
-    #                                  cfg.lr, device, num_classes, False, 'Stochastic', r=int(bud), valid=False)
-    #     kappa_iterations = int(cfg.kappa * max_iteration)
-    #
-    # elif args.dss_strategy == 'CRAIG':
-    #     # CRAIG Selection strategy
-    #     setf_model = CRAIGStrategy(ult_seq_loader, lt_seq_loader, model1, teacher_model1, ssl_alg, consistency_nored,
-    #                                device, num_classes, False, False, 'PerClass', optimizer='lazy')
-    #     kappa_iterations = int(cfg.kappa * max_iteration)
-    #
-    # elif args.dss_strategy == 'CRAIGPB':
-    #     # CRAIG Selection strategy
-    #     setf_model = CRAIGStrategy(ult_seq_loader, lt_seq_loader, model1, teacher_model1, ssl_alg, consistency_nored,
-    #                                device, num_classes, False, False, 'PerBatch', optimizer='lazy')
-    #     kappa_iterations = int(cfg.kappa * max_iteration)
-    #
-    # elif args.dss_strategy == 'CRAIG-Warm':
-    #     # CRAIG Selection strategy
-    #     setf_model = CRAIGStrategy(ult_seq_loader, lt_seq_loader, model1, teacher_model1, ssl_alg, consistency_nored,
-    #                                device, num_classes, False, False, 'PerClass', optimizer='lazy')
-    #
-    #     kappa_iterations = int(cfg.kappa * max_iteration)
-    #     # full_epochs = round(kappa_epochs * self.configdata['dss_strategy']['fraction'])
-    #
-    # elif args.dss_strategy == 'CRAIGPB-Warm':
-    #     # CRAIG Selection strategy
-    #     setf_model = CRAIGStrategy(ult_seq_loader, lt_seq_loader, model1, teacher_model1, ssl_alg, consistency_nored,
-    #                                device, num_classes, False, False, 'PerBatch', optimizer='lazy')
-    #     kappa_iterations = int(cfg.kappa * max_iteration)
-    #     # full_epochs = round(kappa_epochs * self.configdata['dss_strategy']['fraction'])
-    #
-    # elif args.dss_strategy == 'Random':
-    #     # Random Selection strategy
-    #     setf_model = RandomStrategy(ult_seq_loader, online=False)
-    #     kappa_iterations = int(cfg.kappa * max_iteration)
-    #
-    # elif args.dss_strategy == 'Random-Online':
-    #     # Random-Online Selection strategy
-    #     setf_model = RandomStrategy(ult_seq_loader, online=True)
-    #     kappa_iterations = int(cfg.kappa * max_iteration)
-    #
-    # elif args.dss_strategy == 'GLISTER-Warm':
-    #     # GLISTER Selection strategy
-    #     setf_model = GLISTERStrategy(ult_seq_loader, lt_seq_loader, model1, teacher_model1, ssl_alg, consistency_nored,
-    #                                  cfg.lr, device, num_classes, False, 'Stochastic', r=int(bud), valid=True)
-    #     kappa_iterations = int(cfg.kappa * max_iteration)
-    #
-    # elif args.dss_strategy == 'GLISTER_UL-Warm':
-    #     # GLISTER Selection strategy
-    #     setf_model = GLISTERStrategy(ult_seq_loader, lt_seq_loader, model1, teacher_model1, ssl_alg, consistency_nored,
-    #                                  cfg.lr, device, num_classes, False, 'Stochastic', r=int(bud), valid=False)
-    #     kappa_iterations = int(cfg.kappa * max_iteration)
-    #
-    # elif args.dss_strategy == 'GradMatch-Warm':
-    #     # OMPGradMatch Selection strategy
-    #     setf_model = OMPGradMatchStrategy(ult_seq_loader, lt_seq_loader, model1, teacher_model, ssl_alg,
-    #                                       consistency_nored,
-    #                                       cfg.lr, device, num_classes, True, 'PerBatch', valid=False, lam=0.25,
-    #                                       eps=1e-10)
-    #     kappa_iterations = int(cfg.kappa * max_iteration)
-    #     # full_epochs = round(kappa_epochs * self.configdata['dss_strategy']['fraction'])
-    #
-    # elif args.dss_strategy == 'GradMatchPB-Warm':
-    #     # OMPGradMatch Selection strategy
-    #     setf_model = OMPGradMatchStrategy(ult_seq_loader, lt_seq_loader, model1, teacher_model, ssl_alg,
-    #                                       consistency_nored,
-    #                                       cfg.lr, device, num_classes, True, 'PerBatch', valid=False, lam=0.25,
-    #                                       eps=1e-10)
-    #     kappa_iterations = int(cfg.kappa * max_iteration)
-    #
-    # elif args.dss_strategy == 'Random-Warm':
-    #     kappa_iterations = int(cfg.kappa * max_iteration)
-    #
-    # elif args.dss_strategy == 'Full':
-    #     kappa_iterations = int(0.01 * max_iteration)
+    if args.dss_strategy == 'GradMatch':
+        # OMPGradMatch Selection strategy
+        setf_model = OMPGradMatchStrategy(unlabeled_seq_loader, labeled_seq_loader, model1,
+                                          criterion_nored, args.lr, args.device, args.num_classes,
+                                          True, 'PerClassPerGradient', args, valid=False, lam=0.25, eps=1e-10)
+        kappa_epochs = int(args.kappa * max_epochs)
 
-    print()
+    elif args.dss_strategy == 'GradMatchPB':
+        setf_model = OMPGradMatchStrategy(unlabeled_seq_loader, labeled_seq_loader, model1,
+                                          criterion_nored, args.lr, args.device, args.num_classes,
+                                          True, 'PerBatch', args, valid=False, lam=0.25, eps=1e-10)
+        kappa_epochs = int(args.kappa * max_epochs)
+
+    elif args.dss_strategy == 'GLISTER':
+        # GLISTER Selection strategy
+        setf_model = GLISTERStrategy(unlabeled_seq_loader, labeled_seq_loader, model1, criterion_nored,
+                                     args.lr, args.device, args.num_classes, False, 'Stochastic', args, r=int(bud), valid=True)
+        kappa_epochs = int(args.kappa * max_epochs)
+
+    elif args.dss_strategy == 'GLISTER_UL':
+        # GLISTER Selection strategy
+        setf_model = GLISTERStrategy(unlabeled_seq_loader, labeled_seq_loader, model1, criterion_nored,
+                                     args.lr, args.device, args.num_classes, False, 'Stochastic', args, r=int(bud), valid=False)
+        kappa_epochs = int(args.kappa * max_epochs)
+
+    elif args.dss_strategy == 'CRAIG':
+        # CRAIG Selection strategy
+        setf_model = CRAIGStrategy(unlabeled_seq_loader, labeled_seq_loader, model1, criterion_nored,
+                                    args.device, args.num_classes, False, False, 'PerClass', args, optimizer='lazy')
+        kappa_epochs = int(args.kappa * max_epochs)
+
+    elif args.dss_strategy == 'CRAIGPB':
+        # CRAIG Selection strategy
+        setf_model = CRAIGStrategy(unlabeled_seq_loader, labeled_seq_loader, model1, criterion_nored,
+                                    args.device, args.num_classes, False, False, 'PerBatch', args, optimizer='lazy')
+        kappa_epochs = int(args.kappa * max_epochs)
+
+    elif args.dss_strategy == 'CRAIG-Warm':
+        # CRAIG Selection strategy
+        setf_model = CRAIGStrategy(unlabeled_seq_loader, labeled_seq_loader, model1, criterion_nored,
+                                    args.device, args.num_classes, False, False, 'PerClass', args, optimizer='lazy')
+        kappa_epochs = int(args.kappa * max_epochs)
+
+    elif args.dss_strategy == 'CRAIGPB-Warm':
+        # CRAIG Selection strategy
+        setf_model = CRAIGStrategy(unlabeled_seq_loader, labeled_seq_loader, model1, criterion_nored,
+                                    args.device, args.num_classes, False, False, 'PerBatch', args, optimizer='lazy')
+        kappa_epochs = int(args.kappa * max_epochs)
+
+    elif args.dss_strategy == 'Random':
+        # Random Selection strategy
+        setf_model = RandomStrategy(unlabeled_seq_loader, online=False)
+        kappa_epochs = int(args.kappa * max_epochs)
+
+    elif args.dss_strategy == 'Random-Online':
+        # Random-Online Selection strategy
+        setf_model = RandomStrategy(unlabeled_seq_loader, online=True)
+        kappa_epochs = int(args.kappa * max_epochs)
+        sel_iter = int((len(unlabeled_dataset) * args.fraction) // (args.batch_size * args.mu))
+
+    elif args.dss_strategy == 'GLISTER-Warm':
+        # GLISTER Selection strategy
+        setf_model = GLISTERStrategy(unlabeled_seq_loader, labeled_seq_loader, model1, criterion_nored,
+                   args.lr, args.device, args.num_classes, False, 'Stochastic', args, r=int(bud), valid=True)
+        kappa_epochs=int(args.kappa * max_epochs)
+
+    elif args.dss_strategy == 'GLISTER_UL-Warm':
+        # GLISTER Selection strategy
+        setf_model = GLISTERStrategy(unlabeled_seq_loader, labeled_seq_loader, model1, criterion_nored,
+                                  args.lr, args.device, args.num_classes, False, 'Stochastic', args, r=int(bud), valid=True)
+        kappa_epochs=int(args.kappa * max_epochs)
+
+    elif args.dss_strategy == 'GradMatch-Warm':
+        # OMPGradMatch Selection strategy
+        setf_model = OMPGradMatchStrategy(unlabeled_seq_loader, labeled_seq_loader, model1,
+                                          criterion_nored, args.lr, args.device, args.num_classes,
+                                          True, 'PerClassPerGradient', args, valid=False, lam=0.25, eps=1e-10)
+        kappa_epochs=int(args.kappa * max_epochs)
+        # full_epochs = round(kappa_epochs * self.configdata['dss_strategy']['fraction'])
+
+    elif args.dss_strategy == 'GradMatchPB-Warm':
+        # OMPGradMatch Selection strategy
+        setf_model = OMPGradMatchStrategy(unlabeled_seq_loader, labeled_seq_loader, model1,
+                                          criterion_nored, args.lr, args.device, args.num_classes,
+                                          True, 'PerBatch', args, valid=False, lam=0.25, eps=1e-10)
+        kappa_epochs=int(args.kappa * max_epochs)
+
+    elif args.dss_strategy == 'Random-Warm':
+        kappa_epochs=int(args.kappa * max_epochs)
+
+    elif args.dss_strategy == 'Full':
+        kappa_epochs=int(args.kappa * max_epochs)
+
     if args.amp:
         from apex import amp
     global best_acc
@@ -463,136 +470,590 @@ def train_subset(args, labeled_dataset, unlabeled_dataset, test_dataset,
     mask_probs = AverageMeter()
     end = time.time()
     curr_iter = 0
-    if args.world_size > 1:
-        labeled_epoch = 0
-        unlabeled_epoch = 0
-        labeled_trainloader.sampler.set_epoch(labeled_epoch)
-        unlabeled_trainloader.sampler.set_epoch(unlabeled_epoch)
 
-    labeled_iter = iter(labeled_trainloader)
-    unlabeled_iter = iter(unlabeled_trainloader)
+    labeled_trainloader = DataLoader(
+        labeled_dataset,
+        sampler=train_sampler(labeled_dataset),
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        drop_last=True)
 
-    model.train()
-    for epoch in range(args.start_epoch, max_epochs):
+    unlabeled_trainloader = DataLoader(
+        unlabeled_dataset,
+        sampler=train_sampler(unlabeled_dataset),
+        batch_size=args.batch_size * args.mu,
+        num_workers=args.num_workers,
+        drop_last=True)
+
+    subset_selection_time = 0
+    training_time = 0
+
+    if args.dss_strategy == 'Full':
+        model.train()
+
         if args.world_size > 1:
+            labeled_epoch = 0
+            unlabeled_epoch = 0
+            labeled_trainloader.sampler.set_epoch(labeled_epoch)
+            unlabeled_trainloader.sampler.set_epoch(unlabeled_epoch)
+
+        labeled_iter = iter(labeled_trainloader)
+        unlabeled_iter = iter(unlabeled_trainloader)
+
+        for epoch in range(args.start_epoch, max_epochs):
             if not args.no_progress:
                 p_bar = tqdm(range(args.eval_step),
                              disable=args.local_rank not in [-1, 0])
-        for batch_idx in range(args.eval_step):
-            curr_iter += 1
-            try:
-                inputs_x, targets_x = labeled_iter.next()
-            except:
-                if args.world_size > 1:
-                    labeled_epoch += 1
-                    labeled_trainloader.sampler.set_epoch(labeled_epoch)
-                labeled_iter = iter(labeled_trainloader)
-                inputs_x, targets_x = labeled_iter.next()
 
-            try:
-                (inputs_u_w, inputs_u_s), _ = unlabeled_iter.next()
-            except:
-                if args.world_size > 1:
-                    unlabeled_epoch += 1
-                    unlabeled_trainloader.sampler.set_epoch(unlabeled_epoch)
-                unlabeled_iter = iter(unlabeled_trainloader)
-                (inputs_u_w, inputs_u_s), _ = unlabeled_iter.next()
+            for batch_idx in range(args.eval_step):
+                batch_start_time = time.time()
+                curr_iter += 1
+                try:
+                    inputs_x, targets_x = labeled_iter.next()
+                except:
+                    if args.world_size > 1:
+                        labeled_epoch += 1
+                        labeled_trainloader.sampler.set_epoch(labeled_epoch)
+                    labeled_iter = iter(labeled_trainloader)
+                    inputs_x, targets_x = labeled_iter.next()
 
-            data_time.update(time.time() - end)
-            batch_size = inputs_x.shape[0]
-            inputs = interleave(
-                torch.cat((inputs_x, inputs_u_w, inputs_u_s)), 2 * args.mu + 1).to(args.device)
-            targets_x = targets_x.to(args.device)
-            logits = model(inputs)
-            logits = de_interleave(logits, 2 * args.mu + 1)
-            logits_x = logits[:batch_size]
-            logits_u_w, logits_u_s = logits[batch_size:].chunk(2)
-            del logits
+                try:
+                    (inputs_u_w, inputs_u_s), _ = unlabeled_iter.next()
+                except:
+                    if args.world_size > 1:
+                        unlabeled_epoch += 1
+                        unlabeled_trainloader.sampler.set_epoch(unlabeled_epoch)
+                    unlabeled_iter = iter(unlabeled_trainloader)
+                    (inputs_u_w, inputs_u_s), _ = unlabeled_iter.next()
 
-            Lx = F.cross_entropy(logits_x, targets_x, reduction='mean')
+                data_time.update(time.time() - end)
+                batch_size = inputs_x.shape[0]
+                inputs = interleave(
+                    torch.cat((inputs_x, inputs_u_w, inputs_u_s)), 2 * args.mu + 1).to(args.device)
+                targets_x = targets_x.to(args.device)
+                logits = model(inputs)
+                logits = de_interleave(logits, 2 * args.mu + 1)
+                logits_x = logits[:batch_size]
+                logits_u_w, logits_u_s = logits[batch_size:].chunk(2)
+                del logits
 
-            pseudo_label = torch.softmax(logits_u_w.detach() / args.T, dim=-1)
-            max_probs, targets_u = torch.max(pseudo_label, dim=-1)
-            mask = max_probs.ge(args.threshold).float()
+                Lx = F.cross_entropy(logits_x, targets_x, reduction='mean')
 
-            Lu = (F.cross_entropy(logits_u_s, targets_u,
-                                  reduction='none') * mask).mean()
+                pseudo_label = torch.softmax(logits_u_w.detach() / args.T, dim=-1)
+                max_probs, targets_u = torch.max(pseudo_label, dim=-1)
+                mask = max_probs.ge(args.threshold).float()
 
-            loss = Lx + args.lambda_u * Lu
+                Lu = (F.cross_entropy(logits_u_s, targets_u,
+                                      reduction='none') * mask).mean()
 
-            if args.amp:
-                with amp.scale_loss(loss, optimizer) as scaled_loss:
-                    scaled_loss.backward()
-            else:
-                loss.backward()
+                loss = Lx + args.lambda_u * Lu
 
-            losses.update(loss.item())
-            losses_x.update(Lx.item())
-            losses_u.update(Lu.item())
-            optimizer.step()
-            scheduler.step()
-            if args.use_ema:
-                ema_model.update(model)
-            model.zero_grad()
+                if args.amp:
+                    with amp.scale_loss(loss, optimizer) as scaled_loss:
+                        scaled_loss.backward()
+                else:
+                    loss.backward()
 
-            batch_time.update(time.time() - end)
-            end = time.time()
-            mask_probs.update(mask.mean().item())
+                losses.update(loss.item())
+                losses_x.update(Lx.item())
+                losses_u.update(Lu.item())
+                optimizer.step()
+                scheduler.step()
+                if args.use_ema:
+                    ema_model.update(model)
+                training_time += (time.time() - batch_start_time)
+                model.zero_grad()
+                batch_time.update(time.time() - end)
+                end = time.time()
+                mask_probs.update(mask.mean().item())
+                if not args.no_progress:
+                    p_bar.set_description(
+                        "Train Epoch: {epoch}/{epochs:4}. Iter: {batch:4}/{iter:4}. LR: {lr:.4f}. Data: {data:.3f}s. Batch: {bt:.3f}s. Loss: {loss:.4f}. Loss_x: {loss_x:.4f}. Loss_u: {loss_u:.4f}. Mask: {mask:.2f}. ".format(
+                            epoch=epoch + 1,
+                            epochs=args.epochs,
+                            batch=batch_idx + 1,
+                            iter=args.eval_step,
+                            lr=scheduler.get_last_lr()[0],
+                            data=data_time.avg,
+                            bt=batch_time.avg,
+                            loss=losses.avg,
+                            loss_x=losses_x.avg,
+                            loss_u=losses_u.avg,
+                            mask=mask_probs.avg))
+                    p_bar.update()
+
             if not args.no_progress:
-                p_bar.set_description(
-                    "Train Epoch: {epoch}/{epochs:4}. Iter: {batch:4}/{iter:4}. LR: {lr:.4f}. Data: {data:.3f}s. Batch: {bt:.3f}s. Loss: {loss:.4f}. Loss_x: {loss_x:.4f}. Loss_u: {loss_u:.4f}. Mask: {mask:.2f}. ".format(
-                        epoch=epoch + 1,
-                        epochs=args.epochs,
-                        batch=batch_idx + 1,
-                        iter=args.eval_step,
-                        lr=scheduler.get_last_lr()[0],
-                        data=data_time.avg,
-                        bt=batch_time.avg,
-                        loss=losses.avg,
-                        loss_x=losses_x.avg,
-                        loss_u=losses_u.avg,
-                        mask=mask_probs.avg))
-                p_bar.update()
+                p_bar.close()
 
-        if not args.no_progress:
-            p_bar.close()
-
-        if args.use_ema:
-            test_model = ema_model.ema
-        else:
-            test_model = model
-
-        if args.local_rank in [-1, 0]:
-            test_loss, test_acc = test(args, test_loader, test_model, epoch)
-
-            args.writer.add_scalar('train/1.train_loss', losses.avg, epoch)
-            args.writer.add_scalar('train/2.train_loss_x', losses_x.avg, epoch)
-            args.writer.add_scalar('train/3.train_loss_u', losses_u.avg, epoch)
-            args.writer.add_scalar('train/4.mask', mask_probs.avg, epoch)
-            args.writer.add_scalar('test/1.test_acc', test_acc, epoch)
-            args.writer.add_scalar('test/2.test_loss', test_loss, epoch)
-
-            is_best = test_acc > best_acc
-            best_acc = max(test_acc, best_acc)
-
-            model_to_save = model.module if hasattr(model, "module") else model
             if args.use_ema:
-                ema_to_save = ema_model.ema.module if hasattr(
-                    ema_model.ema, "module") else ema_model.ema
-            save_checkpoint({
-                'epoch': epoch + 1,
-                'state_dict': model_to_save.state_dict(),
-                'ema_state_dict': ema_to_save.state_dict() if args.use_ema else None,
-                'acc': test_acc,
-                'best_acc': best_acc,
-                'optimizer': optimizer.state_dict(),
-                'scheduler': scheduler.state_dict(),
-            }, is_best, args.out)
+                test_model = ema_model.ema
+            else:
+                test_model = model
 
-            test_accs.append(test_acc)
-            logger.info('Best top-1 acc: {:.2f}'.format(best_acc))
-            logger.info('Mean top-1 acc: {:.2f}\n'.format(
-                np.mean(test_accs[-20:])))
+            if args.local_rank in [-1, 0]:
+                test_loss, test_acc = test(args, test_loader, test_model, epoch)
+
+                args.writer.add_scalar('train/1.train_loss', losses.avg, epoch)
+                args.writer.add_scalar('train/2.train_loss_x', losses_x.avg, epoch)
+                args.writer.add_scalar('train/3.train_loss_u', losses_u.avg, epoch)
+                args.writer.add_scalar('train/4.mask', mask_probs.avg, epoch)
+                args.writer.add_scalar('test/1.test_acc', test_acc, epoch)
+                args.writer.add_scalar('test/2.test_loss', test_loss, epoch)
+
+                is_best = test_acc > best_acc
+                best_acc = max(test_acc, best_acc)
+
+                model_to_save = model.module if hasattr(model, "module") else model
+                if args.use_ema:
+                    ema_to_save = ema_model.ema.module if hasattr(
+                        ema_model.ema, "module") else ema_model.ema
+                save_checkpoint({
+                    'epoch': epoch + 1,
+                    'state_dict': model_to_save.state_dict(),
+                    'ema_state_dict': ema_to_save.state_dict() if args.use_ema else None,
+                    'acc': test_acc,
+                    'best_acc': best_acc,
+                    'optimizer': optimizer.state_dict(),
+                    'scheduler': scheduler.state_dict(),
+                }, is_best, args.out)
+
+                test_accs.append(test_acc)
+                logger.info('Best top-1 acc: {:.2f}'.format(best_acc))
+                logger.info('Mean top-1 acc: {:.2f}\n'.format(
+                    np.mean(test_accs[-20:])))
+
+    elif args.dss_strategy in ['CRAIG', 'CRAIGPB', 'GradMatch', 'GradMatchPB', 'GLISTER', 'GLISTER_UL', 'Random', 'Random-Online']:
+        model.train()
+        if args.world_size > 1:
+            labeled_epoch = 0
+            unlabeled_epoch = 0
+            labeled_trainloader.sampler.set_epoch(labeled_epoch)
+            unlabeled_subloader.sampler.set_epoch(unlabeled_epoch)
+
+        labeled_iter = iter(labeled_trainloader)
+        unlabeled_iter = iter(unlabeled_subloader)
+
+        for epoch in range(args.start_epoch, max_epochs):
+            if not args.no_progress:
+                p_bar = tqdm(range(args.eval_step),
+                             disable=args.local_rank not in [-1, 0])
+
+            for batch_idx in range(args.eval_step):
+                batch_start_time = time.time()
+                curr_iter += 1
+                try:
+                    inputs_x, targets_x = labeled_iter.next()
+                except:
+                    if args.world_size > 1:
+                        labeled_epoch += 1
+                        labeled_trainloader.sampler.set_epoch(labeled_epoch)
+                    labeled_iter = iter(labeled_trainloader)
+                    inputs_x, targets_x = labeled_iter.next()
+
+                try:
+                    ((inputs_u_w, inputs_u_s), _), weights = unlabeled_iter.next()
+                except:
+                    if args.world_size > 1:
+                        unlabeled_epoch += 1
+                        unlabeled_subloader.sampler.set_epoch(unlabeled_epoch)
+                    unlabeled_iter = iter(unlabeled_subloader)
+                    ((inputs_u_w, inputs_u_s), _), weights = unlabeled_iter.next()
+
+                data_time.update(time.time() - end)
+                weights = weights.to(args.device)
+                batch_size = inputs_x.shape[0]
+                inputs = interleave(
+                    torch.cat((inputs_x, inputs_u_w, inputs_u_s)), 2 * args.mu + 1).to(args.device)
+                targets_x = targets_x.to(args.device)
+                logits = model(inputs)
+                logits = de_interleave(logits, 2 * args.mu + 1)
+                logits_x = logits[:batch_size]
+                logits_u_w, logits_u_s = logits[batch_size:].chunk(2)
+                del logits
+
+                Lx = F.cross_entropy(logits_x, targets_x, reduction='mean')
+
+                pseudo_label = torch.softmax(logits_u_w.detach() / args.T, dim=-1)
+                max_probs, targets_u = torch.max(pseudo_label, dim=-1)
+                mask = max_probs.ge(args.threshold).float()
+
+                Lu = (F.cross_entropy(logits_u_s, targets_u,
+                                      reduction='none') * mask * weights).mean()
+                loss = Lx + args.lambda_u * Lu
+
+                if args.amp:
+                    with amp.scale_loss(loss, optimizer) as scaled_loss:
+                        scaled_loss.backward()
+                else:
+                    loss.backward()
+
+                losses.update(loss.item())
+                losses_x.update(Lx.item())
+                losses_u.update(Lu.item())
+                optimizer.step()
+                scheduler.step()
+                if args.use_ema:
+                    ema_model.update(model)
+                training_time += (time.time() - batch_start_time)
+                model.zero_grad()
+                batch_time.update(time.time() - end)
+                end = time.time()
+                mask_probs.update(mask.mean().item())
+                if not args.no_progress:
+                    p_bar.set_description(
+                        "Train Epoch: {epoch}/{epochs:4}. Iter: {batch:4}/{iter:4}. LR: {lr:.4f}. Data: {data:.3f}s. Batch: {bt:.3f}s. Loss: {loss:.4f}. Loss_x: {loss_x:.4f}. Loss_u: {loss_u:.4f}. Mask: {mask:.2f}. ".format(
+                            epoch=epoch + 1,
+                            epochs=args.epochs,
+                            batch=batch_idx + 1,
+                            iter=args.eval_step,
+                            lr=scheduler.get_last_lr()[0],
+                            data=data_time.avg,
+                            bt=batch_time.avg,
+                            loss=losses.avg,
+                            loss_x=losses_x.avg,
+                            loss_u=losses_u.avg,
+                            mask=mask_probs.avg))
+                    p_bar.update()
+
+                if curr_iter % sel_iter == 0:
+                    start_time = time.time()
+                    # Perform Subset Selection
+                    cached_state_dict = copy.deepcopy(model.state_dict())
+                    clone_dict = copy.deepcopy(model.state_dict())
+                    subset_idxs, gammas = setf_model.select(int(bud), clone_dict)
+                    model.load_state_dict(cached_state_dict)
+                    idxs = subset_idxs
+                    if args.dss_strategy in ['GradMatch', 'GradMatchPB', 'CRAIG', 'CRAIGPB']:
+                        gammas = torch.from_numpy(np.array(gammas)).to(torch.float32)
+                    subset_selection_time += (time.time() - start_time)
+                    unlabeled_subset = CustomSubset(unlabeled_dataset, idxs, gammas)
+                    unlabeled_subloader = DataLoader(
+                        unlabeled_subset,
+                        sampler=train_sampler(unlabeled_subset),
+                        batch_size=args.batch_size * args.mu,
+                        num_workers=args.num_workers,
+                        drop_last=True)
+                    unlabeled_iter = iter(unlabeled_subloader)
+            if not args.no_progress:
+                p_bar.close()
+
+            if args.use_ema:
+                test_model = ema_model.ema
+            else:
+                test_model = model
+
+            if args.local_rank in [-1, 0]:
+                test_loss, test_acc = test(args, test_loader, test_model, epoch)
+
+                args.writer.add_scalar('train/1.train_loss', losses.avg, epoch)
+                args.writer.add_scalar('train/2.train_loss_x', losses_x.avg, epoch)
+                args.writer.add_scalar('train/3.train_loss_u', losses_u.avg, epoch)
+                args.writer.add_scalar('train/4.mask', mask_probs.avg, epoch)
+                args.writer.add_scalar('test/1.test_acc', test_acc, epoch)
+                args.writer.add_scalar('test/2.test_loss', test_loss, epoch)
+
+                is_best = test_acc > best_acc
+                best_acc = max(test_acc, best_acc)
+
+                model_to_save = model.module if hasattr(model, "module") else model
+                if args.use_ema:
+                    ema_to_save = ema_model.ema.module if hasattr(
+                        ema_model.ema, "module") else ema_model.ema
+                save_checkpoint({
+                    'epoch': epoch + 1,
+                    'state_dict': model_to_save.state_dict(),
+                    'ema_state_dict': ema_to_save.state_dict() if args.use_ema else None,
+                    'acc': test_acc,
+                    'best_acc': best_acc,
+                    'optimizer': optimizer.state_dict(),
+                    'scheduler': scheduler.state_dict(),
+                }, is_best, args.out)
+
+                test_accs.append(test_acc)
+                logger.info('Best top-1 acc: {:.2f}'.format(best_acc))
+                logger.info('Mean top-1 acc: {:.2f}\n'.format(
+                    np.mean(test_accs[-20:])))
+
+    elif args.dss_strategy in ['CRAIGPB-Warm', 'CRAIG-Warm', 'GradMatch-Warm', 'GradMatchPB-Warm',
+                               'GLISTER-Warm', 'GLISTER_UL-Warm', 'Random-Warm']:
+        model.train()
+
+        if args.world_size > 1:
+            labeled_epoch = 0
+            unlabeled_epoch = 0
+            labeled_trainloader.sampler.set_epoch(labeled_epoch)
+            unlabeled_trainloader.sampler.set_epoch(unlabeled_epoch)
+
+        labeled_iter = iter(labeled_trainloader)
+        unlabeled_iter = iter(unlabeled_trainloader)
+
+        for epoch in range(args.start_epoch, kappa_epochs):
+            #if args.world_size > 1:
+            if not args.no_progress:
+                p_bar = tqdm(range(args.eval_step),
+                             disable=args.local_rank not in [-1, 0])
+
+            for batch_idx in range(args.eval_step):
+                batch_start_time = time.time()
+                curr_iter += 1
+                try:
+                    inputs_x, targets_x = labeled_iter.next()
+                except:
+                    if args.world_size > 1:
+                        labeled_epoch += 1
+                        labeled_trainloader.sampler.set_epoch(labeled_epoch)
+                    labeled_iter = iter(labeled_trainloader)
+                    inputs_x, targets_x = labeled_iter.next()
+
+                try:
+                    (inputs_u_w, inputs_u_s), _ = unlabeled_iter.next()
+                except:
+                    if args.world_size > 1:
+                        unlabeled_epoch += 1
+                        unlabeled_subloader.sampler.set_epoch(unlabeled_epoch)
+                    unlabeled_iter = iter(unlabeled_subloader)
+                    (inputs_u_w, inputs_u_s), _ = unlabeled_iter.next()
+
+                data_time.update(time.time() - end)
+                batch_size = inputs_x.shape[0]
+                inputs = interleave(
+                    torch.cat((inputs_x, inputs_u_w, inputs_u_s)), 2 * args.mu + 1).to(args.device)
+                targets_x = targets_x.to(args.device)
+                logits = model(inputs)
+                logits = de_interleave(logits, 2 * args.mu + 1)
+                logits_x = logits[:batch_size]
+                logits_u_w, logits_u_s = logits[batch_size:].chunk(2)
+                del logits
+                Lx = F.cross_entropy(logits_x, targets_x, reduction='mean')
+                pseudo_label = torch.softmax(logits_u_w.detach() / args.T, dim=-1)
+                max_probs, targets_u = torch.max(pseudo_label, dim=-1)
+                mask = max_probs.ge(args.threshold).float()
+                Lu = (F.cross_entropy(logits_u_s, targets_u,
+                                      reduction='none') * mask).mean()
+                loss = Lx + args.lambda_u * Lu
+                if args.amp:
+                    with amp.scale_loss(loss, optimizer) as scaled_loss:
+                        scaled_loss.backward()
+                else:
+                    loss.backward()
+
+                losses.update(loss.item())
+                losses_x.update(Lx.item())
+                losses_u.update(Lu.item())
+                optimizer.step()
+                scheduler.step()
+                if args.use_ema:
+                    ema_model.update(model)
+                training_time += (time.time() - batch_start_time)
+                model.zero_grad()
+                batch_time.update(time.time() - end)
+                end = time.time()
+                mask_probs.update(mask.mean().item())
+                if not args.no_progress:
+                    p_bar.set_description(
+                        "Train Epoch: {epoch}/{epochs:4}. Iter: {batch:4}/{iter:4}. LR: {lr:.4f}. Data: {data:.3f}s. Batch: {bt:.3f}s. Loss: {loss:.4f}. Loss_x: {loss_x:.4f}. Loss_u: {loss_u:.4f}. Mask: {mask:.2f}. ".format(
+                            epoch=epoch + 1,
+                            epochs=args.epochs,
+                            batch=batch_idx + 1,
+                            iter=args.eval_step,
+                            lr=scheduler.get_last_lr()[0],
+                            data=data_time.avg,
+                            bt=batch_time.avg,
+                            loss=losses.avg,
+                            loss_x=losses_x.avg,
+                            loss_u=losses_u.avg,
+                            mask=mask_probs.avg))
+                    p_bar.update()
+            if not args.no_progress:
+                p_bar.close()
+
+            if args.use_ema:
+                test_model = ema_model.ema
+            else:
+                test_model = model
+
+            if args.local_rank in [-1, 0]:
+                test_loss, test_acc = test(args, test_loader, test_model, epoch)
+
+                args.writer.add_scalar('train/1.train_loss', losses.avg, epoch)
+                args.writer.add_scalar('train/2.train_loss_x', losses_x.avg, epoch)
+                args.writer.add_scalar('train/3.train_loss_u', losses_u.avg, epoch)
+                args.writer.add_scalar('train/4.mask', mask_probs.avg, epoch)
+                args.writer.add_scalar('test/1.test_acc', test_acc, epoch)
+                args.writer.add_scalar('test/2.test_loss', test_loss, epoch)
+
+                is_best = test_acc > best_acc
+                best_acc = max(test_acc, best_acc)
+
+                model_to_save = model.module if hasattr(model, "module") else model
+                if args.use_ema:
+                    ema_to_save = ema_model.ema.module if hasattr(
+                        ema_model.ema, "module") else ema_model.ema
+                save_checkpoint({
+                    'epoch': epoch + 1,
+                    'state_dict': model_to_save.state_dict(),
+                    'ema_state_dict': ema_to_save.state_dict() if args.use_ema else None,
+                    'acc': test_acc,
+                    'best_acc': best_acc,
+                    'optimizer': optimizer.state_dict(),
+                    'scheduler': scheduler.state_dict(),
+                }, is_best, args.out)
+
+                test_accs.append(test_acc)
+                logger.info('Best top-1 acc: {:.2f}'.format(best_acc))
+                logger.info('Mean top-1 acc: {:.2f}\n'.format(
+                    np.mean(test_accs[-20:])))
+
+        model.train()
+        if args.world_size > 1:
+            labeled_epoch = 0
+            unlabeled_epoch = 0
+            labeled_trainloader.sampler.set_epoch(labeled_epoch)
+            unlabeled_subloader.sampler.set_epoch(unlabeled_epoch)
+
+        labeled_iter = iter(labeled_trainloader)
+        unlabeled_iter = iter(unlabeled_subloader)
+
+        for epoch in range(kappa_epochs, max_epochs):
+            #if args.world_size > 1:
+            if not args.no_progress:
+                p_bar = tqdm(range(args.eval_step),
+                             disable=args.local_rank not in [-1, 0])
+
+            for batch_idx in range(args.eval_step):
+                batch_start_time = time.time()
+                curr_iter += 1
+                try:
+                    inputs_x, targets_x = labeled_iter.next()
+                except:
+                    if args.world_size > 1:
+                        labeled_epoch += 1
+                        labeled_trainloader.sampler.set_epoch(labeled_epoch)
+                    labeled_iter = iter(labeled_trainloader)
+                    inputs_x, targets_x = labeled_iter.next()
+
+                try:
+                    ((inputs_u_w, inputs_u_s), _), weights = unlabeled_iter.next()
+                except:
+                    if args.world_size > 1:
+                        unlabeled_epoch += 1
+                        unlabeled_subloader.sampler.set_epoch(unlabeled_epoch)
+                    unlabeled_iter = iter(unlabeled_subloader)
+                    ((inputs_u_w, inputs_u_s), _), weights = unlabeled_iter.next()
+
+                data_time.update(time.time() - end)
+                weights = weights.to(args.device)
+                batch_size = inputs_x.shape[0]
+                inputs = interleave(
+                    torch.cat((inputs_x, inputs_u_w, inputs_u_s)), 2 * args.mu + 1).to(args.device)
+                targets_x = targets_x.to(args.device)
+                logits = model(inputs)
+                logits = de_interleave(logits, 2 * args.mu + 1)
+                logits_x = logits[:batch_size]
+                logits_u_w, logits_u_s = logits[batch_size:].chunk(2)
+                del logits
+
+                Lx = F.cross_entropy(logits_x, targets_x, reduction='mean')
+
+                pseudo_label = torch.softmax(logits_u_w.detach() / args.T, dim=-1)
+                max_probs, targets_u = torch.max(pseudo_label, dim=-1)
+                mask = max_probs.ge(args.threshold).float()
+
+                Lu = (F.cross_entropy(logits_u_s, targets_u,
+                                      reduction='none') * mask * weights).mean()
+                loss = Lx + args.lambda_u * Lu
+
+                if args.amp:
+                    with amp.scale_loss(loss, optimizer) as scaled_loss:
+                        scaled_loss.backward()
+                else:
+                    loss.backward()
+
+                losses.update(loss.item())
+                losses_x.update(Lx.item())
+                losses_u.update(Lu.item())
+                optimizer.step()
+                scheduler.step()
+                if args.use_ema:
+                    ema_model.update(model)
+                training_time += (time.time() - batch_start_time)
+                model.zero_grad()
+                batch_time.update(time.time() - end)
+                end = time.time()
+                mask_probs.update(mask.mean().item())
+                if not args.no_progress:
+                    p_bar.set_description(
+                        "Train Epoch: {epoch}/{epochs:4}. Iter: {batch:4}/{iter:4}. LR: {lr:.4f}. Data: {data:.3f}s. Batch: {bt:.3f}s. Loss: {loss:.4f}. Loss_x: {loss_x:.4f}. Loss_u: {loss_u:.4f}. Mask: {mask:.2f}. ".format(
+                            epoch=epoch + 1,
+                            epochs=args.epochs,
+                            batch=batch_idx + 1,
+                            iter=args.eval_step,
+                            lr=scheduler.get_last_lr()[0],
+                            data=data_time.avg,
+                            bt=batch_time.avg,
+                            loss=losses.avg,
+                            loss_x=losses_x.avg,
+                            loss_u=losses_u.avg,
+                            mask=mask_probs.avg))
+                    p_bar.update()
+
+                if curr_iter % sel_iter == 0:
+                    start_time = time.time()
+                    # Perform Subset Selection
+                    cached_state_dict = copy.deepcopy(model.state_dict())
+                    clone_dict = copy.deepcopy(model.state_dict())
+                    subset_idxs, gammas = setf_model.select(int(bud), clone_dict)
+                    model.load_state_dict(cached_state_dict)
+                    idxs = subset_idxs
+                    if args.dss_strategy in ['GradMatch-Warm', 'GradMatchPB-Warm', 'CRAIG-Warm', 'CRAIGPB-Warm']:
+                        gammas = torch.from_numpy(np.array(gammas)).to(torch.float32)
+                    subset_selection_time += (time.time() - start_time)
+                    unlabeled_subset = CustomSubset(unlabeled_dataset, idxs, gammas)
+                    unlabeled_subloader = DataLoader(
+                        unlabeled_subset,
+                        sampler=train_sampler(unlabeled_subset),
+                        batch_size=args.batch_size * args.mu,
+                        num_workers=args.num_workers,
+                        drop_last=True)
+                    unlabeled_iter = iter(unlabeled_subloader)
+            if not args.no_progress:
+                p_bar.close()
+
+            if args.use_ema:
+                test_model = ema_model.ema
+            else:
+                test_model = model
+
+            if args.local_rank in [-1, 0]:
+                test_loss, test_acc = test(args, test_loader, test_model, epoch)
+
+                args.writer.add_scalar('train/1.train_loss', losses.avg, epoch)
+                args.writer.add_scalar('train/2.train_loss_x', losses_x.avg, epoch)
+                args.writer.add_scalar('train/3.train_loss_u', losses_u.avg, epoch)
+                args.writer.add_scalar('train/4.mask', mask_probs.avg, epoch)
+                args.writer.add_scalar('test/1.test_acc', test_acc, epoch)
+                args.writer.add_scalar('test/2.test_loss', test_loss, epoch)
+
+                is_best = test_acc > best_acc
+                best_acc = max(test_acc, best_acc)
+
+                model_to_save = model.module if hasattr(model, "module") else model
+                if args.use_ema:
+                    ema_to_save = ema_model.ema.module if hasattr(
+                        ema_model.ema, "module") else ema_model.ema
+                save_checkpoint({
+                    'epoch': epoch + 1,
+                    'state_dict': model_to_save.state_dict(),
+                    'ema_state_dict': ema_to_save.state_dict() if args.use_ema else None,
+                    'acc': test_acc,
+                    'best_acc': best_acc,
+                    'optimizer': optimizer.state_dict(),
+                    'scheduler': scheduler.state_dict(),
+                }, is_best, args.out)
+                test_accs.append(test_acc)
+                logger.info('Best top-1 acc: {:.2f}'.format(best_acc))
+                logger.info('Mean top-1 acc: {:.2f}\n'.format(np.mean(test_accs[-20:])))
+                logger.info('Training Time\n'.format(subset_selection_time + training_time))
 
     if args.local_rank in [-1, 0]:
         args.writer.close()
@@ -647,5 +1108,3 @@ def test(args, test_loader, model, epoch):
 
 if __name__ == '__main__':
     main()
-    #x = torch.zeros(30, 100)
-    #s = interleave(x, 15)

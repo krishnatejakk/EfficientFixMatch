@@ -103,35 +103,19 @@ class GLISTERStrategy(DataSelectionStrategy):
                 for batch_idx, (inputs, targets) in enumerate(self.valloader):
                     inputs, targets = inputs.to(self.device), targets.to(self.device, non_blocking=True)
 
-                    if loss_name == 'MeanSquared':
-                        tmp_targets = torch.zeros(len(inputs), self.num_classes, device=self.device)
-                        tmp_targets[torch.arange(len(inputs)), targets] = 1
-                        targets = tmp_targets
-
                     if batch_idx == 0:
                         out, l1 = self.model(inputs, last=True, freeze=True)
-                        if loss_name == 'MeanSquared':
-                            temp_out = F.softmax(out, dim=1)
-                            loss = F.mse_loss(temp_out, targets, reduction='none').sum()
-                        else:
-                            loss = F.cross_entropy(out, targets, reduction='none').sum()
+                        loss = F.cross_entropy(out, targets, reduction='none').sum()
                         l0_grads = torch.autograd.grad(loss, out)[0]
                         if self.linear_layer:
                             l0_expand = torch.repeat_interleave(l0_grads, embDim, dim=1)
                             l1_grads = l0_expand * l1.repeat(1, self.num_classes)
                         self.init_out = out
                         self.init_l1 = l1
-                        if loss_name == 'MeanSquared':
-                            self.y_val = targets
-                        else:
-                            self.y_val = targets.view(-1, 1)
+                        self.y_val = targets.view(-1, 1)
                     else:
                         out, l1 = self.model(inputs, last=True, freeze=True)
-                        if loss_name == 'MeanSquared':
-                            temp_out = F.softmax(out, dim=1)
-                            loss = F.mse_loss(temp_out, targets, reduction='none').sum()
-                        else:
-                            loss = F.cross_entropy(out, targets, reduction='none').sum()
+                        loss = F.cross_entropy(out, targets, reduction='none').sum()
                         batch_l0_grads = torch.autograd.grad(loss, out)[0]
                         if self.linear_layer:
                             batch_l0_expand = torch.repeat_interleave(batch_l0_grads, embDim, dim=1)
@@ -141,21 +125,14 @@ class GLISTERStrategy(DataSelectionStrategy):
                             l1_grads = torch.cat((l1_grads, batch_l1_grads), dim=0)
                         self.init_out = torch.cat((self.init_out, out), dim=0)
                         self.init_l1 = torch.cat((self.init_l1, l1), dim=0)
-                        if loss_name == 'MeanSquared':
-                            self.y_val = torch.cat((self.y_val, targets), dim=0)
-                        else:
-                            self.y_val = torch.cat((self.y_val, targets.view(-1, 1)), dim=0)
+                        self.y_val = torch.cat((self.y_val, targets.view(-1, 1)), dim=0)
             elif grads_currX is not None:
                 out_vec = self.init_out - (
                         self.eta * grads_currX[0][0:self.num_classes].view(1, -1).expand(self.init_out.shape[0], -1))
                 if self.linear_layer:
                     out_vec = out_vec - (self.eta * torch.matmul(self.init_l1, grads_currX[0][self.num_classes:].view(
                         self.num_classes, -1).transpose(0, 1)))
-                if loss_name == 'MeanSquared':
-                    temp_out_vec = F.softmax(out_vec, dim=1)
-                    loss = self.loss(temp_out_vec, self.y_val, torch.ones(len(temp_out_vec), device=self.device)).sum()
-                else:
-                    loss = self.loss(out_vec, self.y_val, torch.ones(len(out_vec), device=self.device)).sum()
+                loss = self.loss(out_vec, self.y_val.view(-1)).sum()
                 l0_grads = torch.autograd.grad(loss, out_vec)[0]
                 if self.linear_layer:
                     l0_expand = torch.repeat_interleave(l0_grads, embDim, dim=1)
@@ -171,11 +148,7 @@ class GLISTERStrategy(DataSelectionStrategy):
                     ul_weak_aug, ul_strong_aug = ul_weak_aug.to(self.device), ul_strong_aug.to(self.device)
                     if batch_idx == 0:
                         out, l1 = self.model(ul_strong_aug, last=True, freeze=True)
-                        if loss_name == 'MeanSquared':
-                            temp_out = F.softmax(out, dim=1)
-                            loss = self.loss(temp_out, self.weak_targets[batch_idx], self.weak_masks[batch_idx]).sum()
-                        else:
-                            loss = self.loss(out, self.weak_targets[batch_idx], self.weak_masks[batch_idx]).sum()
+                        loss = (self.loss(out, self.weak_targets[batch_idx]) * self.weak_masks[batch_idx]).sum()
                         l0_grads = torch.autograd.grad(loss, out)[0]
                         if self.linear_layer:
                             l0_expand = torch.repeat_interleave(l0_grads, embDim, dim=1)
@@ -184,11 +157,7 @@ class GLISTERStrategy(DataSelectionStrategy):
                         self.init_l1 = l1
                     else:
                         out, l1 = self.model(ul_strong_aug, last=True, freeze=True)
-                        if loss_name == 'MeanSquared':
-                            temp_out = F.softmax(out, dim=1)
-                            loss = self.loss(temp_out, self.weak_targets[batch_idx], self.weak_masks[batch_idx]).sum()
-                        else:
-                            loss = self.loss(out, self.weak_targets[batch_idx], self.weak_masks[batch_idx]).sum()
+                        loss = (self.loss(out, self.weak_targets[batch_idx]) * self.weak_masks[batch_idx]).sum()
                         batch_l0_grads = torch.autograd.grad(loss, out)[0]
                         if self.linear_layer:
                             batch_l0_expand = torch.repeat_interleave(batch_l0_grads, embDim, dim=1)
@@ -206,12 +175,8 @@ class GLISTERStrategy(DataSelectionStrategy):
                     out_vec = out_vec - (self.eta * torch.matmul(self.init_l1, grads_currX[0][self.num_classes:].view(
                         self.num_classes, -1).transpose(0, 1)))
 
-                if loss_name == 'MeanSquared':
-                    temp_out_vec = F.softmax(out_vec, dim=1)
-                    loss = self.loss(temp_out_vec, torch.cat(self.weak_targets, dim=0), torch.cat(self.weak_masks, dim=0)).sum()
-                else:
-                    loss = self.loss(out_vec, torch.cat(self.weak_targets, dim=0),
-                                     torch.cat(self.weak_masks, dim=0)).sum()
+                loss = (self.loss(out_vec, torch.cat(self.weak_targets, dim=0))  *
+                                 torch.cat(self.weak_masks, dim=0)).sum()
                 l0_grads = torch.autograd.grad(loss, out_vec)[0]
                 if self.linear_layer:
                     l0_expand = torch.repeat_interleave(l0_grads, embDim, dim=1)

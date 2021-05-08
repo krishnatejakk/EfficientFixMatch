@@ -107,26 +107,26 @@ class OMPGradMatchStrategy(DataSelectionStrategy):
             gammas = []
             for i in range(self.num_classes):
                 trn_subset_idx = torch.where(self.trn_lbls == i)[0].tolist()
-                trn_data_sub = Subset(self.trainloader.dataset, trn_subset_idx)
-                self.pctrainloader = DataLoader(trn_data_sub, batch_size=self.trainloader.batch_size,
-                                          shuffle=False, pin_memory=True)
-                if self.valid:
-                    val_subset_idx = torch.where(self.val_lbls == i)[0].tolist()
-                    val_data_sub = Subset(self.valloader.dataset, val_subset_idx)
-                    self.pcvalloader = DataLoader(val_data_sub, batch_size=self.trainloader.batch_size,
-                                                    shuffle=False, pin_memory=True)
+                if len(trn_subset_idx) > 0:
+                    trn_data_sub = Subset(self.trainloader.dataset, trn_subset_idx)
+                    self.pctrainloader = DataLoader(trn_data_sub, batch_size=self.trainloader.batch_size,
+                                              shuffle=False, pin_memory=True)
+                    if self.valid:
+                        val_subset_idx = torch.where(self.val_lbls == i)[0].tolist()
+                        val_data_sub = Subset(self.valloader.dataset, val_subset_idx)
+                        self.pcvalloader = DataLoader(val_data_sub, batch_size=self.trainloader.batch_size,
+                                                        shuffle=False, pin_memory=True)
 
-                self.compute_gradients(self.valid, batch=False, perClass=True)
-                trn_gradients = self.grads_per_elem
-                if self.valid:
-                    sum_val_grad = torch.sum(self.val_grads_per_elem, dim=0)
-                else:
-                    sum_val_grad = torch.sum(trn_gradients, dim=0)
-                idxs_temp, gammas_temp = self.ompwrapper(torch.transpose(trn_gradients, 0, 1),
-                                          sum_val_grad, math.ceil(budget * len(trn_subset_idx) / self.N_trn))
-                idxs.extend(list(np.array(trn_subset_idx)[idxs_temp]))
-                gammas.extend(gammas_temp)
-
+                    self.compute_gradients(self.valid, batch=False, perClass=True)
+                    trn_gradients = self.grads_per_elem
+                    if self.valid:
+                        sum_val_grad = torch.sum(self.val_grads_per_elem, dim=0)
+                    else:
+                        sum_val_grad = torch.sum(trn_gradients, dim=0)
+                    idxs_temp, gammas_temp = self.ompwrapper(torch.transpose(trn_gradients, 0, 1),
+                                              sum_val_grad, math.ceil(budget * len(trn_subset_idx) / self.N_trn))
+                    idxs.extend(list(np.array(trn_subset_idx)[idxs_temp]))
+                    gammas.extend(gammas_temp)
         elif self.selection_type == 'PerBatch':
             self.compute_gradients(self.valid, batch=True, perClass=False)
             idxs = []
@@ -151,35 +151,36 @@ class OMPGradMatchStrategy(DataSelectionStrategy):
             embDim = self.model.get_embedding_dim()
             for i in range(self.num_classes):
                 trn_subset_idx = torch.where(self.trn_lbls == i)[0].tolist()
-                trn_data_sub = Subset(self.trainloader.dataset, trn_subset_idx)
-                self.pctrainloader = DataLoader(trn_data_sub, batch_size=self.trainloader.batch_size,
-                                          shuffle=False, pin_memory=True)
-                if self.valid:
-                    val_subset_idx = torch.where(self.val_lbls == i)[0].tolist()
-                    val_data_sub = Subset(self.valloader.dataset, val_subset_idx)
-                    self.pcvalloader = DataLoader(val_data_sub, batch_size=self.trainloader.batch_size,
-                                                    shuffle=False, pin_memory=True)
-                self.compute_gradients(self.valid, batch=False, perClass=True)
-                trn_gradients = self.grads_per_elem
-                tmp_gradients = trn_gradients[:, i].view(-1, 1)
-                tmp1_gradients = trn_gradients[:,
-                                 self.num_classes + (embDim * i): self.num_classes + (embDim * (i + 1))]
-                trn_gradients = torch.cat((tmp_gradients, tmp1_gradients), dim=1)
-
-                if self.valid:
-                    val_gradients = self.val_grads_per_elem
-                    tmp_gradients = val_gradients[:, i].view(-1, 1)
-                    tmp1_gradients = val_gradients[:,
+                if len(trn_subset_idx) > 0:
+                    trn_data_sub = Subset(self.trainloader.dataset, trn_subset_idx)
+                    self.pctrainloader = DataLoader(trn_data_sub, batch_size=self.trainloader.batch_size,
+                                              shuffle=False, pin_memory=True)
+                    if self.valid:
+                        val_subset_idx = torch.where(self.val_lbls == i)[0].tolist()
+                        val_data_sub = Subset(self.valloader.dataset, val_subset_idx)
+                        self.pcvalloader = DataLoader(val_data_sub, batch_size=self.trainloader.batch_size,
+                                                        shuffle=False, pin_memory=True)
+                    self.compute_gradients(self.valid, batch=False, perClass=True)
+                    trn_gradients = self.grads_per_elem
+                    tmp_gradients = trn_gradients[:, i].view(-1, 1)
+                    tmp1_gradients = trn_gradients[:,
                                      self.num_classes + (embDim * i): self.num_classes + (embDim * (i + 1))]
-                    val_gradients = torch.cat((tmp_gradients, tmp1_gradients), dim=1)
-                    sum_val_grad = torch.sum(val_gradients, dim=0)
-                else:
-                    sum_val_grad = torch.sum(trn_gradients, dim=0)
+                    trn_gradients = torch.cat((tmp_gradients, tmp1_gradients), dim=1)
 
-                idxs_temp, gammas_temp = self.ompwrapper(torch.transpose(trn_gradients, 0, 1),
-                                          sum_val_grad, math.ceil(budget * len(trn_subset_idx) / self.N_trn))
-                idxs.extend(list(np.array(trn_subset_idx)[idxs_temp]))
-                gammas.extend(gammas_temp)
+                    if self.valid:
+                        val_gradients = self.val_grads_per_elem
+                        tmp_gradients = val_gradients[:, i].view(-1, 1)
+                        tmp1_gradients = val_gradients[:,
+                                         self.num_classes + (embDim * i): self.num_classes + (embDim * (i + 1))]
+                        val_gradients = torch.cat((tmp_gradients, tmp1_gradients), dim=1)
+                        sum_val_grad = torch.sum(val_gradients, dim=0)
+                    else:
+                        sum_val_grad = torch.sum(trn_gradients, dim=0)
+
+                    idxs_temp, gammas_temp = self.ompwrapper(torch.transpose(trn_gradients, 0, 1),
+                                              sum_val_grad, math.ceil(budget * len(trn_subset_idx) / self.N_trn))
+                    idxs.extend(list(np.array(trn_subset_idx)[idxs_temp]))
+                    gammas.extend(gammas_temp)
 
         omp_end_time = time.time()
         diff = budget - len(idxs)

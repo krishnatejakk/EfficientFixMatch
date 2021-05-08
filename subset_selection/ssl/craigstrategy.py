@@ -247,16 +247,16 @@ class CRAIGStrategy(DataSelectionStrategy):
             self.get_labels(valid=False)
             for i in range(self.num_classes):
                 idxs = torch.where(self.trn_lbls == i)[0]
-                self.compute_score(model_params, idxs)
-                fl = apricot.functions.facilityLocation.FacilityLocationSelection(random_state=0, metric='precomputed',
-                                                                                  n_samples=math.ceil(
-                                                                                      budget * len(idxs) / self.N_trn),
-                                                                                  optimizer=self.optimizer)
-                sim_sub = fl.fit_transform(self.dist_mat)
-                greedyList = list(np.argmax(sim_sub, axis=1))
-                gamma = self.compute_gamma(greedyList)
-                total_greedy_list.extend(idxs[greedyList])
-                gammas.extend(gamma)
+                if len(idxs) > 0:
+                    self.compute_score(model_params, idxs)
+                    fl = apricot.functions.facilityLocation.FacilityLocationSelection(random_state=0, metric='precomputed',
+                                                                                      n_samples=math.ceil(budget * len(idxs) / self.N_trn),
+                                                                                      optimizer=self.optimizer)
+                    sim_sub = fl.fit_transform(self.dist_mat)
+                    greedyList = list(np.argmax(sim_sub, axis=1))
+                    gamma = self.compute_gamma(greedyList)
+                    total_greedy_list.extend(idxs[greedyList])
+                    gammas.extend(gamma)
             rand_indices = np.random.permutation(len(total_greedy_list))
             total_greedy_list = list(np.array(total_greedy_list)[rand_indices])
             gammas = list(np.array(gammas)[rand_indices])
