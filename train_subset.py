@@ -151,7 +151,7 @@ def main():
                         help="For distributed training: local_rank")
     parser.add_argument('--no-progress', action='store_true',
                         help="don't use progress bar")
-    parser.add_argument('--dss_strategy', type=str, default='Full',
+    parser.add_argument('--dss_strategy', type=str, default='GLISTER-Warm',
                         help="Subset Selection Strategy")
     parser.add_argument('--fraction', type=float, default=0.3,
                         help="Subset Size")
@@ -811,13 +811,15 @@ def train_subset(args, labeled_dataset, unlabeled_dataset, test_dataset,
                     if args.world_size > 1:
                         unlabeled_epoch += 1
                         unlabeled_subloader.sampler.set_epoch(unlabeled_epoch)
-                    unlabeled_iter = iter(unlabeled_subloader)
+                    unlabeled_iter = iter(unlabeled_trainloader)
                     (inputs_u_w, inputs_u_s), _ = unlabeled_iter.next()
 
                 data_time.update(time.time() - end)
                 batch_size = inputs_x.shape[0]
+
                 inputs = interleave(
                     torch.cat((inputs_x, inputs_u_w, inputs_u_s)), 2 * args.mu + 1).to(args.device)
+
                 targets_x = targets_x.to(args.device)
                 logits = model(inputs)
                 logits = de_interleave(logits, 2 * args.mu + 1)
