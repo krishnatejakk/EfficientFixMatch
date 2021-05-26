@@ -453,6 +453,7 @@ def train_subset(args, labeled_dataset, unlabeled_dataset, test_dataset,
         kappa_epochs=int(args.kappa * max_epochs)
 
     elif args.dss_strategy == 'Random-Warm':
+        setf_model = RandomStrategy(unlabeled_seq_loader, online=False)
         kappa_epochs=int(args.kappa * max_epochs)
 
     elif args.dss_strategy == 'Full':
