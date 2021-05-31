@@ -159,6 +159,7 @@ def main():
                         help="Subset selection every R epoch")
     parser.add_argument('--kappa', type=float, default=0.5,
                         help="Warm Start Coefficient")
+    parser.add_argument('--max', action='store_true', default=False)
     args = parser.parse_args()
     global best_acc
 
@@ -274,8 +275,12 @@ def main():
                           momentum=0.9, nesterov=args.nesterov)
 
     args.epochs = math.ceil(args.total_steps / args.eval_step)
-    scheduler = get_cosine_schedule_with_warmup(
-        optimizer, args.warmup, args.max_epochs * 1024)
+    if args.dss_strategy == 'Full':
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer, args.warmup, int(args.epochs * 1024))
+    else:
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer, args.warmup, int(args.epochs * args.fraction * 1024))
 
     if args.use_ema:
         from models.ema import ModelEMA
@@ -325,7 +330,10 @@ def train_subset(args, labeled_dataset, unlabeled_dataset, test_dataset,
     if args.dss_strategy == 'Full':
         max_epochs = args.epochs
     else:
-        max_epochs = int(args.epochs * args.fraction)
+        if args.max:
+            max_epochs = int(args.epochs * args.fraction)
+        else:
+            max_epochs = args.epochs
 
     sel_iter = int((args.R * len(unlabeled_dataset) * args.fraction) // (args.batch_size * args.mu))
     N = len(unlabeled_dataset)
