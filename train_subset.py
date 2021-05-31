@@ -275,7 +275,7 @@ def main():
 
     args.epochs = math.ceil(args.total_steps / args.eval_step)
     scheduler = get_cosine_schedule_with_warmup(
-        optimizer, args.warmup, args.total_steps)
+        optimizer, args.warmup, args.max_epochs * 1024)
 
     if args.use_ema:
         from models.ema import ModelEMA
@@ -370,79 +370,79 @@ def train_subset(args, labeled_dataset, unlabeled_dataset, test_dataset,
         setf_model = OMPGradMatchStrategy(unlabeled_seq_loader, labeled_seq_loader, model1,
                                           criterion_nored, args.lr, args.device, args.num_classes,
                                           True, 'PerClassPerGradient', args, valid=False, lam=0.25, eps=1e-10)
-        kappa_epochs = int(args.kappa * max_epochs)
+        kappa_epochs = int(args.kappa * args.epochs * args.fraction)
 
     elif args.dss_strategy == 'GradMatchPB':
         setf_model = OMPGradMatchStrategy(unlabeled_seq_loader, labeled_seq_loader, model1,
                                           criterion_nored, args.lr, args.device, args.num_classes,
                                           True, 'PerBatch', args, valid=False, lam=0.25, eps=1e-10)
-        kappa_epochs = int(args.kappa * max_epochs)
+        kappa_epochs = int(args.kappa * args.epochs * args.fraction)
 
     elif args.dss_strategy == 'GLISTER':
         # GLISTER Selection strategy
         setf_model = GLISTERStrategy(unlabeled_seq_loader, labeled_seq_loader, model1, criterion_nored,
                                      args.lr, args.device, args.num_classes, False, 'Stochastic', args, r=int(bud), valid=True)
-        kappa_epochs = int(args.kappa * max_epochs)
+        kappa_epochs = int(args.kappa * args.epochs * args.fraction)
 
     elif args.dss_strategy == 'GLISTER_UL':
         # GLISTER Selection strategy
         setf_model = GLISTERStrategy(unlabeled_seq_loader, labeled_seq_loader, model1, criterion_nored,
                                      args.lr, args.device, args.num_classes, False, 'Stochastic', args, r=int(bud), valid=False)
-        kappa_epochs = int(args.kappa * max_epochs)
+        kappa_epochs = int(args.kappa * args.epochs * args.fraction)
 
     elif args.dss_strategy == 'CRAIG':
         # CRAIG Selection strategy
         setf_model = CRAIGStrategy(unlabeled_seq_loader, labeled_seq_loader, model1, criterion_nored,
                                     args.device, args.num_classes, False, False, 'PerClass', args, optimizer='lazy')
-        kappa_epochs = int(args.kappa * max_epochs)
+        kappa_epochs = int(args.kappa * args.epochs * args.fraction)
 
     elif args.dss_strategy == 'CRAIGPB':
         # CRAIG Selection strategy
         setf_model = CRAIGStrategy(unlabeled_seq_loader, labeled_seq_loader, model1, criterion_nored,
                                     args.device, args.num_classes, False, False, 'PerBatch', args, optimizer='lazy')
-        kappa_epochs = int(args.kappa * max_epochs)
+        kappa_epochs = int(args.kappa * args.epochs * args.fraction)
 
     elif args.dss_strategy == 'CRAIG-Warm':
         # CRAIG Selection strategy
         setf_model = CRAIGStrategy(unlabeled_seq_loader, labeled_seq_loader, model1, criterion_nored,
                                     args.device, args.num_classes, False, False, 'PerClass', args, optimizer='lazy')
-        kappa_epochs = int(args.kappa * max_epochs)
+        kappa_epochs = int(args.kappa * args.epochs * args.fraction)
 
     elif args.dss_strategy == 'CRAIGPB-Warm':
         # CRAIG Selection strategy
         setf_model = CRAIGStrategy(unlabeled_seq_loader, labeled_seq_loader, model1, criterion_nored,
                                     args.device, args.num_classes, False, False, 'PerBatch', args, optimizer='lazy')
-        kappa_epochs = int(args.kappa * max_epochs)
+        kappa_epochs = int(args.kappa * args.epochs * args.fraction)
 
     elif args.dss_strategy == 'Random':
         # Random Selection strategy
         setf_model = RandomStrategy(unlabeled_seq_loader, online=False)
-        kappa_epochs = int(args.kappa * max_epochs)
+        kappa_epochs = int(args.kappa * args.epochs * args.fraction)
 
     elif args.dss_strategy == 'Random-Online':
         # Random-Online Selection strategy
         setf_model = RandomStrategy(unlabeled_seq_loader, online=True)
-        kappa_epochs = int(args.kappa * max_epochs)
+        kappa_epochs = int(args.kappa * args.epochs * args.fraction)
         sel_iter = int((len(unlabeled_dataset) * args.fraction) // (args.batch_size * args.mu))
 
     elif args.dss_strategy == 'GLISTER-Warm':
         # GLISTER Selection strategy
         setf_model = GLISTERStrategy(unlabeled_seq_loader, labeled_seq_loader, model1, criterion_nored,
                    args.lr, args.device, args.num_classes, False, 'Stochastic', args, r=int(bud), valid=True)
-        kappa_epochs=int(args.kappa * max_epochs)
+        kappa_epochs=int(args.kappa * args.epochs * args.fraction)
 
     elif args.dss_strategy == 'GLISTER_UL-Warm':
         # GLISTER Selection strategy
         setf_model = GLISTERStrategy(unlabeled_seq_loader, labeled_seq_loader, model1, criterion_nored,
                                   args.lr, args.device, args.num_classes, False, 'Stochastic', args, r=int(bud), valid=True)
-        kappa_epochs=int(args.kappa * max_epochs)
+        kappa_epochs=int(args.kappa * args.epochs * args.fraction)
 
     elif args.dss_strategy == 'GradMatch-Warm':
         # OMPGradMatch Selection strategy
         setf_model = OMPGradMatchStrategy(unlabeled_seq_loader, labeled_seq_loader, model1,
                                           criterion_nored, args.lr, args.device, args.num_classes,
                                           True, 'PerClassPerGradient', args, valid=False, lam=0.25, eps=1e-10)
-        kappa_epochs=int(args.kappa * max_epochs)
+        kappa_epochs=int(args.kappa * args.epochs * args.fraction)
         # full_epochs = round(kappa_epochs * self.configdata['dss_strategy']['fraction'])
 
     elif args.dss_strategy == 'GradMatchPB-Warm':
@@ -450,14 +450,14 @@ def train_subset(args, labeled_dataset, unlabeled_dataset, test_dataset,
         setf_model = OMPGradMatchStrategy(unlabeled_seq_loader, labeled_seq_loader, model1,
                                           criterion_nored, args.lr, args.device, args.num_classes,
                                           True, 'PerBatch', args, valid=False, lam=0.25, eps=1e-10)
-        kappa_epochs=int(args.kappa * max_epochs)
+        kappa_epochs=int(args.kappa * args.epochs * args.fraction)
 
     elif args.dss_strategy == 'Random-Warm':
         setf_model = RandomStrategy(unlabeled_seq_loader, online=False)
-        kappa_epochs=int(args.kappa * max_epochs)
+        kappa_epochs=int(args.kappa * args.epochs * args.fraction)
 
     elif args.dss_strategy == 'Full':
-        kappa_epochs=int(args.kappa * max_epochs)
+        kappa_epochs=int(args.kappa * args.epochs * args.fraction)
 
     if args.amp:
         from apex import amp
