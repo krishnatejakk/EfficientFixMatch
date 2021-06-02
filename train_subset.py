@@ -331,9 +331,9 @@ def train_subset(args, labeled_dataset, unlabeled_dataset, test_dataset,
         max_epochs = args.epochs
     else:
         if args.max:
-            max_epochs = int(args.epochs * args.fraction)
-        else:
             max_epochs = args.epochs
+        else:
+            max_epochs = int(args.epochs * args.fraction)
 
     sel_iter = int((args.R * len(unlabeled_dataset) * args.fraction) // (args.batch_size * args.mu))
     N = len(unlabeled_dataset)
